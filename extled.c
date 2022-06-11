@@ -9,7 +9,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/gpio/consumer.h>
-//#include <linux/timer.h>
+#include <linux/hrtimer.h>
 #include <asm/current.h>
 #include <asm/uaccess.h>
 
@@ -24,6 +24,9 @@ struct extled_device_info {
     struct cdev cdev;
     struct class *class;
     struct gpio_desc *gpio;
+    struct hrtimer pwm_timer;
+    unsigned int priod; // pwmベース周期　ns
+    unsigned int on_time; // 周期あたりのLED ON時間 ns
 };
 
 // /dev/ectled配下のアクセス関数
@@ -65,20 +68,64 @@ static ssize_t extled_write(struct file *fp, const char __user *buf, size_t coun
     struct extled_device_info *bdev = fp->private_data;
     char outValue;
     int result;
+    int pwm_width;
 
     if (bdev==NULL) return -EBADF;
     if (count == 0) return 0;
     result = get_user(outValue, &buf[0]);
     if (result != 0) return result;
     
-    if (outValue=='0' || outValue=='1') {
-        gpiod_set_value(bdev->gpio , outValue - '0');
-        pr_devel("%s: writed [%c] \n", __func__, outValue);
-    } else {
-        pr_info("%s: no writed. arg=\"%c\"\n", __func__ , outValue);
+    hrtimer_cancel(&bdev->pwm_timer);
+    switch (outValue) {
+        case '0':
+            gpiod_set_value(bdev->gpio, 0);
+            pr_devel("%s: writed [%c] \n", __func__, outValue);
+            break;
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+            pwm_width = outValue - '0';
+            bdev->on_time = bdev->priod / 9 * pwm_width;
+            gpiod_set_value(bdev->gpio, 1);
+            hrtimer_start(&bdev->pwm_timer, 
+                    ktime_set(0, bdev->on_time), HRTIMER_MODE_REL);
+            pr_devel("%s: writed [%c] \n", __func__, outValue);
+            break;
+        case '9':
+            gpiod_set_value(bdev->gpio, 1);
+            pr_devel("%s: writed [%c] \n", __func__, outValue);
+            break;
+        default:
+            pr_info("%s: no writed. arg=\"%c\"\n", __func__ , outValue);
     }
 
     return count;
+}
+
+// pwm_timer(hrtimer)用の割り込み処理関数
+enum hrtimer_restart pwm_timer_handler(struct hrtimer *timer) {
+    struct extled_device_info *bdev = from_timer(bdev, timer, pwm_timer);
+    int next_priod;
+
+    if (!bdev) {
+        pr_err("%s:デバイス情報取得失敗\n", __func__);
+        return HRTIMER_NORESTART;
+    }
+    int cur_led = gpiod_get_value(bdev->gpio);
+    if (cur_led == 1) {
+        next_priod = bdev->priod - bdev->on_time;
+        gpiod_set_value(bdev->gpio, 0);
+    } else {
+        next_priod = bdev->on_time;
+        gpiod_set_value(bdev->gpio, 1);
+    }
+    hrtimer_forward_now(&bdev->pwm_timer, ktime_set(0, next_priod));
+    return HRTIMER_RESTART;
 }
 
 /* ハンドラ　テーブル */
@@ -124,6 +171,12 @@ static int make_udev(struct extled_device_info *bdev, const char* name) {
         device_create(bdev->class, NULL, MKDEV(bdev->major, minor), NULL, "extled%d", minor);
     }
 
+    // hrtimerの初期化
+    bdev->priod = 1000000;
+    bdev->on_time = 0;
+    hrtimer_init(&bdev->pwm_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL); 
+    bdev->pwm_timer.function = pwm_timer_handler;
+    
     return 0;
 
 err_class_create:
